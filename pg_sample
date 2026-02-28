@@ -829,23 +829,51 @@ while ($num_rows) {
     my $join1 = join ' AND ',
       map { "f1.$_->[0] = t1.$_->[1]" } @pairs;
 
-    my $join2 = join ' AND ',
-      map { "t1.$_->[1] = s1.$_->[1]" } @pairs;
+    # Use PK columns for duplicate detection to avoid JSON equality issues.
+    # The original approach used LEFT JOIN + SELECT DISTINCT on all columns,
+    # which fails when tables have JSON columns (no equality operator).
+    # We use a subquery approach:
+    # 1. Get distinct FK values from the sample (these reference target rows we need)
+    # 2. Select from target where PK matches those FK values
+    # 3. Exclude rows already in the sample using NOT EXISTS on PK
+    my @pk_cols = find_candidate_key($target_table);
 
-    my $where = join ' AND ',
-      map { "s1.$_->[1] IS NULL" } @pairs;
-
-    # Insert into the sample table all the rows needed to
-    # satisfy the fk table, except those already present.
     my $quoted_cols = $target_table->columns_quoted("t1");
-    my $query = qq{
-      INSERT INTO $target_sample_table
-           SELECT DISTINCT $quoted_cols
-             FROM $target_table t1
-                  JOIN $sample_fk_table f1 ON ($join1)
-                  LEFT JOIN $target_sample_table s1 ON ($join2)
-            WHERE $where
-    };
+    my $query;
+
+    if (@pk_cols) {
+      # Build the PK column references for NOT EXISTS check
+      my $pk_not_exists = join ' AND ',
+        map { "s1." . $target_table->quote_column($_) . " = t1." . $target_table->quote_column($_) } @pk_cols;
+
+      # Build the IN clause matching FK columns to target PK columns
+      # The FK columns in the sample reference the PK columns of the target
+      my $fk_col_list = join ', ', map { "f1.$_->[0]" } @pairs;
+      my $pk_col_list = join ', ', map { "t1.$_->[1]" } @pairs;
+
+      $query = qq{
+        INSERT INTO $target_sample_table
+             SELECT $quoted_cols
+               FROM $target_table t1
+              WHERE ($pk_col_list) IN (SELECT DISTINCT $fk_col_list FROM $sample_fk_table f1)
+                AND NOT EXISTS (SELECT 1 FROM $target_sample_table s1 WHERE $pk_not_exists)
+      };
+    } else {
+      # Fallback for tables without PK: use original approach (may fail on JSON)
+      my $join2 = join ' AND ',
+        map { "t1.$_->[1] = s1.$_->[1]" } @pairs;
+      my $where = join ' AND ',
+        map { "s1.$_->[1] IS NULL" } @pairs;
+
+      $query = qq{
+        INSERT INTO $target_sample_table
+             SELECT DISTINCT $quoted_cols
+               FROM $target_table t1
+                    JOIN $sample_fk_table f1 ON ($join1)
+                    LEFT JOIN $target_sample_table s1 ON ($join2)
+              WHERE $where
+      };
+    }
 
     #warn "\nQUERY:\n$query\n";
     # my $sth = $dbh->prepare(qq{ EXPLAIN $query });
